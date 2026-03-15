@@ -1,0 +1,248 @@
+ """
+DKT（Deep Knowledge Tracing）訓練程式
+資料集：ASSISTments 2017
+目標：比較 DKT 與 AKT 的 AUC，選出較準的模型用於 RL 學習環境
+"""
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
+os.makedirs("./logs/", exist_ok=True)
+
+# ==========================================
+# 0. 設定
+# ==========================================
+DATA_PATH   = r'C:\實驗一\anonymized_full_release_competition_dataset.csv'
+MAX_SEQ_LEN = 200    # 截斷過長序列，兼顧資訊量與訓練速度
+MIN_SEQ_LEN = 3      # 過短的序列沒有意義
+HIDDEN_SIZE = 128
+NUM_LAYERS  = 1
+DROPOUT     = 0.2
+BATCH_SIZE  = 64
+EPOCHS      = 10
+LR          = 1e-3
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_SAVE  = "./logs/dkt_model.pt"
+
+print(f"使用裝置：{DEVICE}")
+
+# ==========================================
+# 1. 讀取與前處理資料
+# ==========================================
+print("\n[Step 1] 讀取資料...")
+df = pd.read_csv(DATA_PATH, usecols=['studentId', 'skill', 'correct'])
+df = df.dropna(subset=['skill', 'correct'])
+df['correct'] = df['correct'].astype(int)
+
+# 技能 ID 映射（0-indexed）
+skills = sorted(df['skill'].unique())
+skill2id = {s: i for i, s in enumerate(skills)}
+df['skill_id'] = df['skill'].map(skill2id)
+NUM_SKILLS = len(skills)
+print(f"技能數：{NUM_SKILLS}，學生數：{df['studentId'].nunique()}，總筆數：{len(df)}")
+
+# 按學生分組，建立序列
+print("[Step 2] 建立學生作答序列...")
+student_seqs = []
+for sid, group in df.groupby('studentId'):
+    skill_ids = group['skill_id'].tolist()
+    corrects  = group['correct'].tolist()
+    if len(skill_ids) < MIN_SEQ_LEN:
+        continue
+    # 截斷到最大長度
+    skill_ids = skill_ids[:MAX_SEQ_LEN]
+    corrects  = corrects[:MAX_SEQ_LEN]
+    student_seqs.append((skill_ids, corrects))
+
+print(f"有效學生序列數：{len(student_seqs)}")
+
+# ==========================================
+# 2. 訓練 / 驗證 / 測試 切割（依學生）
+# ==========================================
+train_seqs, temp_seqs = train_test_split(student_seqs, test_size=0.2, random_state=42)
+val_seqs,   test_seqs = train_test_split(temp_seqs,    test_size=0.5, random_state=42)
+print(f"Train: {len(train_seqs)}  Val: {len(val_seqs)}  Test: {len(test_seqs)}")
+
+# ==========================================
+# 3. Dataset & DataLoader
+# ==========================================
+class DKTDataset(Dataset):
+    """
+    每個樣本為一位學生的作答序列。
+    輸入 x：one-hot(2 * skill_id + correct)，shape (seq_len, 2*NUM_SKILLS)
+    標籤 y：下一步技能的答對率，shape (seq_len, NUM_SKILLS)
+    遮罩 m：有效位置，shape (seq_len,)
+    """
+    def __init__(self, seqs, num_skills, max_seq_len):
+        self.seqs       = seqs
+        self.num_skills = num_skills
+        self.max_seq_len = max_seq_len
+
+    def __len__(self):
+        return len(self.seqs)
+
+    def __getitem__(self, idx):
+        skill_ids, corrects = self.seqs[idx]
+        T = len(skill_ids)
+        
+        # 輸入：one-hot 編碼，維度 2 * num_skills
+        x = np.zeros((self.max_seq_len, 2 * self.num_skills), dtype=np.float32)
+        for t in range(T):
+            x[t, 2 * skill_ids[t] + corrects[t]] = 1.0
+
+        # 標籤：只看下一步的技能是否答對
+        y_skill = np.zeros(self.max_seq_len, dtype=np.int64)   # 下一步技能
+        y_label = np.zeros(self.max_seq_len, dtype=np.float32) # 下一步答對 (0/1)
+        for t in range(T - 1):
+            y_skill[t] = skill_ids[t + 1]
+            y_label[t] = corrects[t + 1]
+
+        # 遮罩：前 T-1 步有效（第 T 步沒有「下一步」）
+        mask = np.zeros(self.max_seq_len, dtype=np.bool_)
+        mask[:T - 1] = True
+
+        return (torch.tensor(x),
+                torch.tensor(y_skill),
+                torch.tensor(y_label),
+                torch.tensor(mask))
+
+
+def make_loader(seqs, shuffle):
+    ds = DKTDataset(seqs, NUM_SKILLS, MAX_SEQ_LEN)
+    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle, num_workers=0)
+
+train_loader = make_loader(train_seqs, shuffle=True)
+val_loader   = make_loader(val_seqs,   shuffle=False)
+test_loader  = make_loader(test_seqs,  shuffle=False)
+
+# ==========================================
+# 4. DKT 模型
+# ==========================================
+class DKT(nn.Module):
+    """
+    標準 DKT（Piech et al., 2015）
+    輸入：x_t = one_hot(2*skill_id + correct)
+    輸出：p_t = sigmoid(W * h_t + b)，預測每個技能的答對率
+    """
+    def __init__(self, input_size, hidden_size, num_skills, num_layers, dropout):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc      = nn.Linear(hidden_size, num_skills)
+
+    def forward(self, x):
+        # x: (batch, seq_len, input_size)
+        h, _ = self.lstm(x)          # (batch, seq_len, hidden)
+        h    = self.dropout(h)
+        out  = self.fc(h)            # (batch, seq_len, num_skills)
+        return torch.sigmoid(out)    # (batch, seq_len, num_skills)
+
+
+model = DKT(
+    input_size  = 2 * NUM_SKILLS,
+    hidden_size = HIDDEN_SIZE,
+    num_skills  = NUM_SKILLS,
+    num_layers  = NUM_LAYERS,
+    dropout     = DROPOUT
+).to(DEVICE)
+
+criterion = nn.BCELoss(reduction='none')
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+print(f"\n模型參數量：{sum(p.numel() for p in model.parameters()):,}")
+
+# ==========================================
+# 5. 訓練與驗證函式
+# ==========================================
+def run_epoch(loader, train=True):
+    model.train() if train else model.eval()
+    total_loss = 0.0
+    all_preds, all_labels = [], []
+
+    ctx = torch.enable_grad() if train else torch.no_grad()
+    with ctx:
+        for x, y_skill, y_label, mask in loader:
+            x, y_skill, y_label, mask = (
+                x.to(DEVICE), y_skill.to(DEVICE),
+                y_label.to(DEVICE), mask.to(DEVICE)
+            )
+
+            pred = model(x)  # (batch, seq_len, num_skills)
+
+            # 取出每個時間步「下一步技能」對應的預測值
+            # y_skill: (batch, seq_len) → gather 對應技能的預測
+            pred_target = pred.gather(
+                2, y_skill.unsqueeze(-1)
+            ).squeeze(-1)  # (batch, seq_len)
+
+            # 只計算 mask=True 的位置
+            loss_mat = criterion(pred_target, y_label)  # (batch, seq_len)
+            loss = (loss_mat * mask.float()).sum() / mask.float().sum()
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            total_loss += loss.item()
+            valid_preds  = pred_target[mask].detach().cpu().numpy()
+            valid_labels = y_label[mask].detach().cpu().numpy()
+            all_preds.append(valid_preds)
+            all_labels.append(valid_labels)
+
+    all_preds  = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    auc = roc_auc_score(all_labels, all_preds)
+    avg_loss = total_loss / len(loader)
+    return avg_loss, auc
+
+# ==========================================
+# 6. 訓練主迴圈
+# ==========================================
+print("\n[Step 3] 開始訓練 DKT...")
+print(f"{'Epoch':>6} {'Train Loss':>12} {'Train AUC':>10} {'Val Loss':>10} {'Val AUC':>10}")
+print("-" * 55)
+
+best_val_auc = 0.0
+for epoch in range(1, EPOCHS + 1):
+    train_loss, train_auc = run_epoch(train_loader, train=True)
+    val_loss,   val_auc   = run_epoch(val_loader,   train=False)
+    scheduler.step()
+
+    print(f"{epoch:>6}  {train_loss:>12.4f}  {train_auc:>10.4f}  {val_loss:>10.4f}  {val_auc:>10.4f}")
+
+    if val_auc > best_val_auc:
+        best_val_auc = val_auc
+        torch.save({
+            'model_state': model.state_dict(),
+            'skill2id':    skill2id,
+            'num_skills':  NUM_SKILLS,
+            'hidden_size': HIDDEN_SIZE,
+            'num_layers':  NUM_LAYERS,
+        }, MODEL_SAVE)
+        print(f"         → 最佳模型已儲存（Val AUC={val_auc:.4f}）")
+
+# ==========================================
+# 7. 測試集最終評估
+# ==========================================
+print("\n[Step 4] 載入最佳模型，測試集評估...")
+ckpt = torch.load(MODEL_SAVE, map_location=DEVICE)
+model.load_state_dict(ckpt['model_state'])
+test_loss, test_auc = run_epoch(test_loader, train=False)
+print(f"Test Loss: {test_loss:.4f}  |  Test AUC: {test_auc:.4f}")
+print(f"\n最佳 Val AUC: {best_val_auc:.4f}  |  Test AUC: {test_auc:.4f}")
+print(f"模型已儲存至：{MODEL_SAVE}")
+print("\n完成！接下來可以跑 AKT 做比較，或直接將此模型整合進 RL 環境。")
