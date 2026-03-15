@@ -44,7 +44,7 @@ for i in range(K):
 # ==========================================
 print("📥 [Phase 1] 正在讀取 ASSISTments 2017 資料集...")
 try:
-    df = pd.read_csv('/content/drive/MyDrive/assistments_full.csv', usecols=['studentId', 'problemId', 'skill', 'correct'])
+    df = pd.read_csv(r'C:\實驗一\anonymized_full_release_competition_dataset.csv', usecols=['studentId', 'problemId', 'skill', 'correct'])
 except FileNotFoundError:
     print("⚠️ 找不到檔案，將生成備用測試用微型資料庫以供除錯...")
     df = pd.DataFrame({
@@ -129,7 +129,8 @@ class EduRLEnv(gym.Env):
         self.student_pool = TRAIN_STUDENTS if mode == 'train' else TEST_STUDENTS
         self.item_bank = REAL_ITEM_BANK
         self.observation_space = spaces.Box(low=-5.0, high=5.0, shape=(2*K + 2,), dtype=np.float32)
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+        # K 維技能優先度：PPO 直接對每個技能輸出優先分數，因果鏈更短
+        self.action_space = spaces.Box(low=-3.0, high=3.0, shape=(K,), dtype=np.float32)
         if seed is not None: np.random.seed(seed)
 
     def reset(self, seed=None, specific_student=None, options=None):
@@ -155,40 +156,33 @@ class EduRLEnv(gym.Env):
                                [self.fail_streak/5.0], [self.same_skill_streak/5.0]], dtype=np.float32)
 
     def step(self, action):
-        exp_w = np.exp(action)
-        weights = exp_w / np.sum(exp_w)
-        best_item, best_score = None, -float('inf')
-        
+        # action 是 K 維技能優先度分數，直接對應 15 個技能
+        # softmax 轉成機率，取 argmax 作為本步目標技能
+        skill_priority = np.exp(action - np.max(action))  # 數值穩定的 softmax
+        skill_priority /= np.sum(skill_priority)
+        target_skill = int(np.argmax(skill_priority))
+
         available_items = [i for i in self.item_bank if i["id"] not in self.used_items]
-        if not available_items: return self._get_obs(), 0.0, True, False, {}
+        if not available_items:
+            return self._get_obs(), 0.0, True, False, {}
 
-        # 分層抽樣 (Stratified Sampling per Skill)，解決抽樣偏差
-        skill_groups = {k: [] for k in range(K)}
-        for item in available_items:
-            skill_groups[item["skill"]].append(item)
-            
-        sample_items = []
-        for k, items in skill_groups.items():
-            if items:
-                n_sample = min(len(items), 20)
-                sampled_idx = np.random.choice(len(items), n_sample, replace=False)
-                sample_items.extend([items[i] for i in sampled_idx])
+        # 先找目標技能的題目；若已全出完則退回全部可用題目
+        skill_items = [i for i in available_items if i["skill"] == target_skill]
+        candidate_items = skill_items if skill_items else available_items
 
-        for item in sample_items:
-            k, b, a = item["skill"], item["b"], item["a"]
-            score = (weights[0] * fisher_information_2pl(self.est_theta[k], a, b) * self.est_variance[k] +
-                     weights[1] * np.exp(-((b - self.est_theta[k])**2) / 300.0) +
-                     weights[2] * (1.0 if (self.fail_streak >= 2 and b < self.est_theta[k]) else 0.0) +
-                     weights[3] * np.sum(relation_matrix[k] * (self.est_theta - 100.0)) / 100.0)
-            if score > best_score: best_score, best_item = score, item
-
+        # 在候選題中選 ZPD 最佳：P_est 最接近 0.75 的題
+        best_item = min(
+            candidate_items,
+            key=lambda i: abs(irt_prob_2pl(self.est_theta[i["skill"]], i["a"], i["b"]) - 0.75)
+        )
         return self.step_direct(best_item)
 
     def step_direct(self, best_item):
         self.step_count += 1
         self.used_items.add(best_item["id"])
         k_target = best_item["skill"]
-        old_true_theta = self.true_theta.copy()
+        old_true_theta = self.true_theta.copy()  # 僅供 info/評估用，不參與 reward
+        old_est_theta = self.est_theta.copy()    # reward 只用這個
 
         P_true = irt_prob_2pl(self.true_theta[k_target], best_item["a"], best_item["b"])
         u = 1 if np.random.rand() < P_true else 0
@@ -223,10 +217,11 @@ class EduRLEnv(gym.Env):
         self.same_skill_streak = self.same_skill_streak + 1 if k_target == self.last_skill else 0
         self.last_skill = k_target
 
-        mean_gain = np.mean(self.true_theta) - np.mean(old_true_theta)
-        weak_gain = np.min(self.true_theta) - np.min(old_true_theta)
-        r_balance = -0.3 * (np.std(self.true_theta) - np.std(old_true_theta))
-        
+        # Reward 完全基於可觀測的 est_theta，不偷看 true_theta
+        mean_gain = np.mean(self.est_theta) - np.mean(old_est_theta)
+        weak_gain = np.min(self.est_theta) - np.min(old_est_theta)
+        r_balance = -0.3 * (np.std(self.est_theta) - np.std(old_est_theta))
+
         reward = (40.0 * mean_gain) + (60.0 * weak_gain) + r_balance - 0.1
         
         done = self.step_count >= MAX_STEPS
@@ -255,8 +250,12 @@ def run_trajectory_test(model, env_fn, test_students, max_steps=30, agent_name="
                 action, _ = model.predict(env._get_obs(), deterministic=True)
                 obs, reward, term, trunc, info = env.step(action)
             else:
+                # ZPD 對照組：選 P_est 最接近 0.75 的題（目標與 RL 一致，比較才公平）
                 available_items = [i for i in env.item_bank if i["id"] not in env.used_items]
-                best_item = max(available_items, key=lambda i: fisher_information_2pl(env.est_theta[i["skill"]], i["a"], i["b"]))
+                best_item = min(
+                    available_items,
+                    key=lambda i: abs(irt_prob_2pl(env.est_theta[i["skill"]], i["a"], i["b"]) - 0.75)
+                )
                 obs, reward, term, trunc, info = env.step_direct(best_item)
 
             all_process_logs.append({
@@ -275,13 +274,14 @@ def run_trajectory_test(model, env_fn, test_students, max_steps=30, agent_name="
 # ==========================================
 if __name__ == "__main__":
     print("\n🚀 [Phase 2] 正在訓練建立於真實資料上的 RL Meta-Controller (500,000 steps)...")
+    print("   [修正版] Action: K維技能優先度 | Reward: est_theta | 對照: ZPD策略")
     env_fn = lambda: EduRLEnv(mode='train')
     
     rl_model = PPO("MlpPolicy", env_fn(), verbose=1, 
                    learning_rate=3e-4, n_steps=2048, batch_size=128, gamma=0.95)
     rl_model.learn(total_timesteps=500000)
     
-    print("\n📈 [Phase 3] 正在進行 RL vs CAT 的分層微觀教學歷程測試...")
+    print("\n📈 [Phase 3] 正在進行 RL vs ZPD 的分層微觀教學歷程測試...")
     
     # 計算測試集中所有學生的平均能力值
     test_student_means = np.mean(TEST_STUDENTS, axis=1)
@@ -307,17 +307,17 @@ if __name__ == "__main__":
         print(f"\n🔍 正在測試 {group_name} 程度的學生群組...")
         
         rl_log_df = run_trajectory_test(rl_model, eval_env_fn, students, agent_name="RL")
-        cat_log_df = run_trajectory_test(None, eval_env_fn, students, agent_name="CAT")
+        zpd_log_df = run_trajectory_test(None, eval_env_fn, students, agent_name="ZPD")
         
         # 加入一個欄位標記這是哪個能力層次的學生，方便後續畫圖區分
         rl_log_df["Ability_Level"] = group_name
-        cat_log_df["Ability_Level"] = group_name
+        zpd_log_df["Ability_Level"] = group_name
         
-        combined_df = pd.concat([rl_log_df, cat_log_df])
+        combined_df = pd.concat([rl_log_df, zpd_log_df])
         all_final_dfs.append(combined_df)
 
     # 合併所有階層的結果並存檔
     final_master_df = pd.concat(all_final_dfs)
-    final_master_df.to_csv('./logs/RealData_Teaching_Process_(0315第5版).csv', index=False)
-    
-    print("🎉 執行完畢！分層微觀歷程檔案已儲存至 ./logs/RealData_Teaching_Process_Stratified.csv")
+    final_master_df.to_csv('./logs/RealData_Teaching_Process_(0315第6版_修正).csv', index=False)
+
+    print("🎉 執行完畢！分層微觀歷程檔案已儲存至 ./logs/RealData_Teaching_Process_(0315第6版_修正).csv")
